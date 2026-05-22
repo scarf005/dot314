@@ -30,6 +30,14 @@
         "from": "../../extensions/_shared/normalize-target-cwd.ts",
         "to": "extensions/_shared/normalize-target-cwd.ts"
       },
+      {
+        "from": "../../extensions/_shared/auto-cwd-detection.ts",
+        "to": "extensions/_shared/auto-cwd-detection.ts"
+      },
+      {
+        "from": "../../extensions/_shared/pi-spawn.ts",
+        "to": "extensions/_shared/pi-spawn.ts"
+      },
       { "from": "../../LICENSE", "to": "LICENSE" }
     ]
   }

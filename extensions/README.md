@@ -101,6 +101,7 @@
 
 - ● [`move-session.ts`](move-session.ts)
   - `/move-session <targetCwd>` moves the *current session* to a different working directory, intended for when you started pi in one folder but come to find that you need it in another after building up valuable context
+  - `/move-session-auto on|off|status` toggles opt-in automatic cwd detection; `PI_MOVE_SESSION_AUTO_CWD=1` enables it at startup
   - `/move-session $main-worktree` moves the session to the repository's main Git worktree, useful when retiring a linked worktree after preserving a valuable session
   - Forks the session JSONL into the target cwd bucket (`SessionManager.forkFrom(...)`), clears the fork header's `parentSession` pointer, then relaunches `pi --session <fork>` with `cwd=<targetCwd>` so the footer + built-in tools resolve relative paths against the new directory
   - Uses `trash` to delete the old session file (best-effort); if `trash` isn't available, it leaves the old file in place

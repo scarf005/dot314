@@ -1,7 +1,8 @@
 /**
  * Session Move Extension
  *
- * Move the current session into another cwd bucket and relaunch pi in that directory
+ * Move the current session into another cwd bucket and relaunch pi in that directory.
+ * Optionally auto-detect bash/user-bash cwd changes and move at the end of the turn.
  *
  * Implementation strategy:
  *  1) Fork the current session file into the target cwd bucket using SessionManager.forkFrom()
@@ -14,10 +15,11 @@
  *
  * Usage:
  *   /move-session <targetCwd>
+ *   /move-session-auto on|off|status
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType, SessionManager } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import {
     statSync,
@@ -28,17 +30,42 @@ import {
     renameSync,
     unlinkSync,
 } from "node:fs";
+import { resolve } from "node:path";
 
+import {
+    appendCwdProbe,
+    createCwdProbeMarker,
+    extractCwdProbe,
+    isAutoCwdEnabled,
+    parseSimpleCdTarget,
+} from "./_shared/auto-cwd-detection";
 import {
     getMainWorktreeRootFromWorktreeList,
     isMainWorktreeTarget,
     MAIN_WORKTREE_TOKEN,
     normalizeTargetCwd,
 } from "./_shared/normalize-target-cwd";
+import { getPiSpawnCommand } from "./_shared/pi-spawn";
 
 const TRASH_TIMEOUT_MS = 5000;
 const HEADER_READ_MAX = 8192;
 const COPY_CHUNK_SIZE = 65_536;
+
+interface MoveSessionContext {
+    cwd: string;
+    sessionManager: {
+        getSessionFile(): string | undefined;
+        getLeafId(): string | null;
+    };
+    ui: {
+        notify(message: string, level?: "info" | "warning" | "error"): void;
+    };
+}
+
+interface PendingCwdProbe {
+    marker: string;
+    sourceCwd: string;
+}
 
 function getBranchSelectionWarning(
     sourceSessionFile: string,
@@ -133,7 +160,37 @@ function clearParentSession(sessionFile: string): void {
     }
 }
 
+function isSameCwd(left: string, right: string): boolean {
+    return resolve(left) === resolve(right);
+}
+
+function replaceTextContent(
+    content: Array<{ type: string; text?: string; [key: string]: unknown }>,
+    marker: string,
+): { content: Array<{ type: string; text?: string; [key: string]: unknown }>; cwd?: string } {
+    let detectedCwd: string | undefined;
+    const nextContent = content.map((block) => {
+        if (block.type !== "text" || typeof block.text !== "string") {
+            return block;
+        }
+
+        const result = extractCwdProbe(block.text, marker);
+        if (result.cwd !== undefined) {
+            detectedCwd = result.cwd;
+        }
+
+        return { ...block, text: result.text || "(no output)" };
+    });
+
+    return { content: nextContent, cwd: detectedCwd };
+}
+
 export default function (pi: ExtensionAPI) {
+    let autoCwdEnabled = isAutoCwdEnabled();
+    let pendingAutoMoveTarget: string | undefined;
+    let moveInProgress = false;
+    const pendingCwdProbes = new Map<string, PendingCwdProbe>();
+
     const resolveTargetCwd = async (rawTargetCwd: string, cwd: string): Promise<string> => {
         if (!isMainWorktreeTarget(rawTargetCwd)) {
             return normalizeTargetCwd(rawTargetCwd, process.env, cwd);
@@ -162,6 +219,136 @@ export default function (pi: ExtensionAPI) {
         // This extension should never permanently delete session files.
     };
 
+    const moveCurrentSession = async (
+        rawTargetCwd: string,
+        ctx: MoveSessionContext,
+        options: { commandName: string; actionName: string },
+    ) => {
+        if (moveInProgress) return;
+        moveInProgress = true;
+
+        let targetCwd: string;
+        try {
+            targetCwd = await resolveTargetCwd(rawTargetCwd, ctx.cwd);
+        } catch (error: any) {
+            moveInProgress = false;
+            ctx.ui.notify(error?.message ?? String(error), "error");
+            return;
+        }
+
+        let targetCwdStat;
+        try {
+            targetCwdStat = statSync(targetCwd);
+        } catch (error: any) {
+            moveInProgress = false;
+            const code = error?.code;
+            if (code === "ENOENT") {
+                ctx.ui.notify(`Path does not exist: ${targetCwd}`, "error");
+            } else {
+                ctx.ui.notify(`Cannot access path: ${targetCwd}`, "error");
+            }
+            return;
+        }
+
+        if (!targetCwdStat.isDirectory()) {
+            moveInProgress = false;
+            ctx.ui.notify(`Not a directory: ${targetCwd}`, "error");
+            return;
+        }
+
+        const sourceSessionFile = ctx.sessionManager.getSessionFile();
+        if (!sourceSessionFile) {
+            moveInProgress = false;
+            ctx.ui.notify("No persistent session file (maybe started with --no-session)", "error");
+            return;
+        }
+
+        const branchSelectionWarning = getBranchSelectionWarning(
+            sourceSessionFile,
+            ctx.sessionManager.getLeafId() as string | null,
+            options.commandName,
+            options.actionName,
+        );
+        if (branchSelectionWarning) {
+            ctx.ui.notify(branchSelectionWarning, "warning");
+        }
+
+        try {
+            const forked = SessionManager.forkFrom(sourceSessionFile, targetCwd);
+            const destSessionFile = forked.getSessionFile();
+
+            if (!destSessionFile) {
+                moveInProgress = false;
+                ctx.ui.notify("Internal error: forkFrom() produced no session file", "error");
+                return;
+            }
+
+            // We intend to move/replace the original session, so avoid leaving
+            // a parentSession pointer that may dangle after trashing the source.
+            try {
+                clearParentSession(destSessionFile);
+            } catch (error: any) {
+                ctx.ui.notify(
+                    `Warning: could not clear parent session reference: ${error?.message ?? String(error)}`,
+                    "warning",
+                );
+            }
+
+            // --- Tear down the parent's terminal usage ---
+            // We do this BEFORE spawning, to avoid nesting Kitty protocol flags.
+            process.stdout.write("\x1b[<u");      // Pop kitty keyboard protocol
+            process.stdout.write("\x1b[?2004l");  // Disable bracketed paste
+            process.stdout.write("\x1b[?25h");    // Show cursor
+            process.stdout.write("\r\n");         // Ensure child starts on a clean line
+
+            if (process.stdin.isTTY) {
+                process.stdin.setRawMode(false);
+            }
+
+            // Spawn new pi in the target directory
+            const piCommand = getPiSpawnCommand(["--session", destSessionFile]);
+            const child = spawn(piCommand.command, piCommand.args, {
+                cwd: targetCwd,
+                stdio: "inherit",
+            });
+
+            child.once("spawn", () => {
+                // Trash the old session file *after* the new process is actually running
+                void trashFileBestEffort(sourceSessionFile);
+
+                // Stop the parent from stealing keypresses.
+                // destroy() is important; pause() was not sufficient.
+                process.stdin.removeAllListeners();
+                process.stdin.destroy();
+
+                // Avoid the parent reacting to Ctrl+C / termination signals.
+                // (The child is the process the user is interacting with.)
+                process.removeAllListeners("SIGINT");
+                process.removeAllListeners("SIGTERM");
+                process.on("SIGINT", () => {});
+                process.on("SIGTERM", () => {});
+            });
+
+            child.on("exit", (code) => process.exit(code ?? 0));
+            child.on("error", (err) => {
+                process.stderr.write(`Failed to launch pi: ${err.message}\n`);
+                process.exit(1);
+            });
+        } catch (error: any) {
+            moveInProgress = false;
+            ctx.ui.notify(`Failed to move session: ${error?.message ?? String(error)}`, "error");
+        }
+    };
+
+    const queueAutoMove = (targetCwd: string, sourceCwd: string, ctx: MoveSessionContext) => {
+        if (!autoCwdEnabled || moveInProgress || isSameCwd(targetCwd, sourceCwd)) {
+            return;
+        }
+
+        pendingAutoMoveTarget = targetCwd;
+        ctx.ui.notify(`Detected cwd change to ${targetCwd}; moving Pi session after this turn.`, "info");
+    };
+
     pi.registerCommand("move-session", {
         description: "Move session to another directory and relaunch pi there",
         getArgumentCompletions: (argumentPrefix: string) => {
@@ -185,110 +372,113 @@ export default function (pi: ExtensionAPI) {
                 return;
             }
 
-            let targetCwd: string;
-            try {
-                targetCwd = await resolveTargetCwd(rawTargetCwd, ctx.cwd);
-            } catch (error: any) {
-                ctx.ui.notify(error?.message ?? String(error), "error");
-                return;
-            }
-
-            let targetCwdStat;
-            try {
-                targetCwdStat = statSync(targetCwd);
-            } catch (error: any) {
-                const code = error?.code;
-                if (code === "ENOENT") {
-                    ctx.ui.notify(`Path does not exist: ${targetCwd}`, "error");
-                } else {
-                    ctx.ui.notify(`Cannot access path: ${targetCwd}`, "error");
-                }
-                return;
-            }
-
-            if (!targetCwdStat.isDirectory()) {
-                ctx.ui.notify(`Not a directory: ${targetCwd}`, "error");
-                return;
-            }
-
-            const sourceSessionFile = ctx.sessionManager.getSessionFile();
-            if (!sourceSessionFile) {
-                ctx.ui.notify("No persistent session file (maybe started with --no-session)", "error");
-                return;
-            }
-
-            const branchSelectionWarning = getBranchSelectionWarning(
-                sourceSessionFile,
-                ctx.sessionManager.getLeafId() as string | null,
-                "/move-session",
-                "moving",
-            );
-            if (branchSelectionWarning) {
-                ctx.ui.notify(branchSelectionWarning, "warning");
-            }
-
-            try {
-                const forked = SessionManager.forkFrom(sourceSessionFile, targetCwd);
-                const destSessionFile = forked.getSessionFile();
-
-                if (!destSessionFile) {
-                    ctx.ui.notify("Internal error: forkFrom() produced no session file", "error");
-                    return;
-                }
-
-                // We intend to move/replace the original session, so avoid leaving
-                // a parentSession pointer that may dangle after trashing the source.
-                try {
-                    clearParentSession(destSessionFile);
-                } catch (error: any) {
-                    ctx.ui.notify(
-                        `Warning: could not clear parent session reference: ${error?.message ?? String(error)}`,
-                        "warning"
-                    );
-                }
-
-                // --- Tear down the parent's terminal usage ---
-                // We do this BEFORE spawning, to avoid nesting Kitty protocol flags.
-                process.stdout.write("\x1b[<u");      // Pop kitty keyboard protocol
-                process.stdout.write("\x1b[?2004l");  // Disable bracketed paste
-                process.stdout.write("\x1b[?25h");    // Show cursor
-                process.stdout.write("\r\n");         // Ensure child starts on a clean line
-
-                if (process.stdin.isTTY) {
-                    process.stdin.setRawMode(false);
-                }
-
-                // Spawn new pi in the target directory
-                const child = spawn("pi", ["--session", destSessionFile], {
-                    cwd: targetCwd,
-                    stdio: "inherit",
-                });
-
-                child.once("spawn", () => {
-                    // Trash the old session file *after* the new process is actually running
-                    void trashFileBestEffort(sourceSessionFile);
-
-                    // Stop the parent from stealing keypresses.
-                    // destroy() is important; pause() was not sufficient.
-                    process.stdin.removeAllListeners();
-                    process.stdin.destroy();
-
-                    // Avoid the parent reacting to Ctrl+C / termination signals.
-                    // (The child is the process the user is interacting with.)
-                    process.removeAllListeners("SIGINT");
-                    process.removeAllListeners("SIGTERM");
-                    process.on("SIGINT", () => {});
-                    process.on("SIGTERM", () => {});
-                });
-
-                child.on("exit", (code) => process.exit(code ?? 0));
-                child.on("error", (err) => {
-                    process.stderr.write(`Failed to launch pi: ${err.message}\n`);
-                    process.exit(1);
-                });
-            } catch (error: any) {
-                ctx.ui.notify(`Failed to move session: ${error?.message ?? String(error)}`, "error");
-            }
+            await moveCurrentSession(rawTargetCwd, ctx, {
+                commandName: "/move-session",
+                actionName: "moving",
+            });
         },
+    });
+
+    pi.registerCommand("move-session-auto", {
+        description: "Enable, disable, or show automatic cwd-change session moves",
+        getArgumentCompletions: (argumentPrefix: string) => {
+            const prefix = argumentPrefix.trim().toLowerCase();
+            return ["on", "off", "status"]
+                .filter((value) => value.startsWith(prefix))
+                .map((value) => ({ value, label: value }));
+        },
+        handler: async (args, ctx) => {
+            const mode = args.trim().toLowerCase() || "status";
+            if (mode === "on") {
+                autoCwdEnabled = true;
+                ctx.ui.notify("Automatic cwd-change session moves enabled.", "info");
+                return;
+            }
+
+            if (mode === "off") {
+                autoCwdEnabled = false;
+                pendingAutoMoveTarget = undefined;
+                pendingCwdProbes.clear();
+                ctx.ui.notify("Automatic cwd-change session moves disabled.", "info");
+                return;
+            }
+
+            if (mode === "status") {
+                ctx.ui.notify(
+                    `Automatic cwd-change session moves are ${autoCwdEnabled ? "enabled" : "disabled"}.`,
+                    "info",
+                );
+                return;
+            }
+
+            ctx.ui.notify("Usage: /move-session-auto on|off|status", "error");
+        },
+    });
+
+    pi.on("tool_call", (event, ctx) => {
+        if (!autoCwdEnabled || moveInProgress || !isToolCallEventType("bash", event)) {
+            return;
+        }
+
+        if (typeof event.input.command !== "string") return;
+
+        const marker = createCwdProbeMarker(event.toolCallId);
+        pendingCwdProbes.set(event.toolCallId, { marker, sourceCwd: ctx.cwd });
+        event.input.command = appendCwdProbe(event.input.command, marker);
+    });
+
+    pi.on("tool_result", (event, ctx) => {
+        if (event.toolName !== "bash") return;
+
+        const pendingProbe = pendingCwdProbes.get(event.toolCallId);
+        if (!pendingProbe) return;
+
+        pendingCwdProbes.delete(event.toolCallId);
+        const result = replaceTextContent(event.content, pendingProbe.marker);
+        if (result.cwd) {
+            queueAutoMove(result.cwd, pendingProbe.sourceCwd, ctx);
+        }
+
+        return { content: result.content };
+    });
+
+    pi.on("agent_end", async (_event, ctx) => {
+        const targetCwd = pendingAutoMoveTarget;
+        if (!targetCwd || !autoCwdEnabled || moveInProgress) return;
+
+        pendingAutoMoveTarget = undefined;
+        await moveCurrentSession(targetCwd, ctx, {
+            commandName: "auto cwd detection",
+            actionName: "auto-moving",
+        });
+    });
+
+    pi.on("user_bash", (event, ctx) => {
+        if (!autoCwdEnabled || moveInProgress) return;
+
+        let targetCwd: string | undefined;
+        try {
+            targetCwd = parseSimpleCdTarget(event.command, process.env, event.cwd);
+        } catch (error: any) {
+            return { result: { output: error?.message ?? String(error), exitCode: 1, cancelled: false, truncated: false } };
+        }
+
+        if (!targetCwd || isSameCwd(targetCwd, event.cwd)) return;
+
+        setImmediate(() => {
+            void moveCurrentSession(targetCwd, ctx, {
+                commandName: "auto cwd detection",
+                actionName: "auto-moving",
+            });
+        });
+
+        return {
+            result: {
+                output: `Detected cwd change to ${targetCwd}; moving Pi session there.`,
+                exitCode: 0,
+                cancelled: false,
+                truncated: false,
+            },
+        };
     });
 }
