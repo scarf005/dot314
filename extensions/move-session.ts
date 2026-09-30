@@ -7,7 +7,7 @@
  * Implementation strategy:
  *  1) Fork the current session file into the target cwd bucket using SessionManager.forkFrom()
  *  2) Clear the fork header's parentSession pointer
- *  3) Tear down the parent's terminal usage (pop kitty protocol, reset modes)
+ *  3) Stop the parent's TUI through the public custom UI API
  *  4) Spawn a new pi process in the target cwd with inherited stdio
  *  5) Once the child has spawned, trash the old session file
  *  6) Once the child has spawned, destroy the parent's stdin so it cannot steal key presses
@@ -18,7 +18,7 @@
  *   /move-session-auto on|off|status
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType, SessionManager } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import {
@@ -51,16 +51,9 @@ const TRASH_TIMEOUT_MS = 5000;
 const HEADER_READ_MAX = 8192;
 const COPY_CHUNK_SIZE = 65_536;
 
-interface MoveSessionContext {
-    cwd: string;
-    sessionManager: {
-        getSessionFile(): string | undefined;
-        getLeafId(): string | null;
-    };
-    ui: {
-        notify(message: string, level?: "info" | "warning" | "error"): void;
-    };
-}
+type MoveSessionContext = Pick<ExtensionContext,
+    "cwd" | "mode" | "hasUI" | "sessionManager" | "ui" | "isIdle" | "hasPendingMessages"
+>;
 
 interface PendingCwdProbe {
     marker: string;
@@ -164,10 +157,10 @@ function isSameCwd(left: string, right: string): boolean {
     return resolve(left) === resolve(right);
 }
 
-function replaceTextContent(
-    content: Array<{ type: string; text?: string; [key: string]: unknown }>,
+function replaceTextContent<T extends { type: string; text?: string }>(
+    content: T[],
     marker: string,
-): { content: Array<{ type: string; text?: string; [key: string]: unknown }>; cwd?: string } {
+): { content: T[]; cwd?: string } {
     let detectedCwd: string | undefined;
     const nextContent = content.map((block) => {
         if (block.type !== "text" || typeof block.text !== "string") {
@@ -189,6 +182,7 @@ export default function (pi: ExtensionAPI) {
     let autoCwdEnabled = isAutoCwdEnabled();
     let pendingAutoMoveTarget: string | undefined;
     let moveInProgress = false;
+    let autoMoveTimer: ReturnType<typeof setTimeout> | undefined;
     const pendingCwdProbes = new Map<string, PendingCwdProbe>();
 
     const resolveTargetCwd = async (rawTargetCwd: string, cwd: string): Promise<string> => {
@@ -222,9 +216,14 @@ export default function (pi: ExtensionAPI) {
     const moveCurrentSession = async (
         rawTargetCwd: string,
         ctx: MoveSessionContext,
-        options: { commandName: string; actionName: string },
+        options: { commandName: string; actionName: string; deferIfBusy?: boolean },
     ) => {
         if (moveInProgress) return;
+        // Older supported Pi contexts expose hasUI, but not mode.
+        if (ctx.mode === undefined ? !ctx.hasUI : ctx.mode !== "tui") {
+            ctx.ui.notify("Moving a session requires interactive TUI mode.", "error");
+            return;
+        }
         moveInProgress = true;
 
         let targetCwd: string;
@@ -233,6 +232,18 @@ export default function (pi: ExtensionAPI) {
         } catch (error: any) {
             moveInProgress = false;
             ctx.ui.notify(error?.message ?? String(error), "error");
+            return;
+        }
+
+        // Resolution can await git. Do not fork while new work is running or queued.
+        if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+            moveInProgress = false;
+            if (options.deferIfBusy) {
+                pendingAutoMoveTarget ??= targetCwd;
+                scheduleAutoMove(ctx, 100);
+            } else {
+                ctx.ui.notify("Session is busy or has queued messages; try /move-session again when idle.", "warning");
+            }
             return;
         }
 
@@ -294,45 +305,51 @@ export default function (pi: ExtensionAPI) {
                 );
             }
 
-            // --- Tear down the parent's terminal usage ---
-            // We do this BEFORE spawning, to avoid nesting Kitty protocol flags.
-            process.stdout.write("\x1b[<u");      // Pop kitty keyboard protocol
-            process.stdout.write("\x1b[?2004l");  // Disable bracketed paste
-            process.stdout.write("\x1b[?25h");    // Show cursor
-            process.stdout.write("\r\n");         // Ensure child starts on a clean line
+            // The public interactive-shell example uses custom() + tui.stop() to
+            // release the terminal. Unlike disabling stdin, stop() also cancels
+            // renders and removes resize listeners before the child can write.
+            await ctx.ui.custom<void>((tui, _theme, _keybindings, _done) => {
+                const piCommand = getPiSpawnCommand(["--session", destSessionFile]);
+                tui.stop();
 
-            if (process.stdin.isTTY) {
-                process.stdin.setRawMode(false);
-            }
+                let child;
+                try {
+                    child = spawn(piCommand.command, piCommand.args, {
+                        cwd: targetCwd,
+                        stdio: "inherit",
+                    });
+                } catch (error) {
+                    // A synchronous spawn failure leaves the parent usable.
+                    tui.start();
+                    throw error;
+                }
 
-            // Spawn new pi in the target directory
-            const piCommand = getPiSpawnCommand(["--session", destSessionFile]);
-            const child = spawn(piCommand.command, piCommand.args, {
-                cwd: targetCwd,
-                stdio: "inherit",
-            });
+                child.once("spawn", () => {
+                    // Trash the old session file *after* the new process is actually running
+                    void trashFileBestEffort(sourceSessionFile);
 
-            child.once("spawn", () => {
-                // Trash the old session file *after* the new process is actually running
-                void trashFileBestEffort(sourceSessionFile);
+                    // Stop the parent from stealing keypresses.
+                    // destroy() is important; pause() was not sufficient.
+                    process.stdin.removeAllListeners();
+                    process.stdin.destroy();
 
-                // Stop the parent from stealing keypresses.
-                // destroy() is important; pause() was not sufficient.
-                process.stdin.removeAllListeners();
-                process.stdin.destroy();
+                    // Avoid the parent reacting to Ctrl+C / termination signals.
+                    // (The child is the process the user is interacting with.)
+                    process.removeAllListeners("SIGINT");
+                    process.removeAllListeners("SIGTERM");
+                    process.on("SIGINT", () => {});
+                    process.on("SIGTERM", () => {});
+                });
 
-                // Avoid the parent reacting to Ctrl+C / termination signals.
-                // (The child is the process the user is interacting with.)
-                process.removeAllListeners("SIGINT");
-                process.removeAllListeners("SIGTERM");
-                process.on("SIGINT", () => {});
-                process.on("SIGTERM", () => {});
-            });
+                child.on("exit", (code) => process.exit(code ?? 0));
+                child.on("error", (err) => {
+                    process.stderr.write(`Failed to launch pi: ${err.message}\n`);
+                    process.exit(1);
+                });
 
-            child.on("exit", (code) => process.exit(code ?? 0));
-            child.on("error", (err) => {
-                process.stderr.write(`Failed to launch pi: ${err.message}\n`);
-                process.exit(1);
+                // Do not complete custom() or restart the parent while the child
+                // owns the terminal. The wrapper exits with the child, as before.
+                return { render: () => [], invalidate: () => {} };
             });
         } catch (error: any) {
             moveInProgress = false;
@@ -346,7 +363,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         pendingAutoMoveTarget = targetCwd;
-        ctx.ui.notify(`Detected cwd change to ${targetCwd}; moving Pi session after this turn.`, "info");
+        ctx.ui.notify(`Detected cwd change to ${targetCwd}; moving Pi session when idle.`, "info");
     };
 
     pi.registerCommand("move-session", {
@@ -398,6 +415,8 @@ export default function (pi: ExtensionAPI) {
             if (mode === "off") {
                 autoCwdEnabled = false;
                 pendingAutoMoveTarget = undefined;
+                clearTimeout(autoMoveTimer);
+                autoMoveTimer = undefined;
                 pendingCwdProbes.clear();
                 ctx.ui.notify("Automatic cwd-change session moves disabled.", "info");
                 return;
@@ -442,16 +461,40 @@ export default function (pi: ExtensionAPI) {
         return { content: result.content };
     });
 
-    pi.on("agent_end", async (_event, ctx) => {
-        const targetCwd = pendingAutoMoveTarget;
-        if (!targetCwd || !autoCwdEnabled || moveInProgress) return;
+    const scheduleAutoMove = (ctx: MoveSessionContext, delayMs = 0) => {
+        if (autoMoveTimer || !pendingAutoMoveTarget || !autoCwdEnabled || moveInProgress) return;
+        // Leave event dispatch first. agent_end can precede retries/compaction;
+        // keep checking idle even when manual compaction ends without a new run.
+        autoMoveTimer = setTimeout(() => {
+            autoMoveTimer = undefined;
+            const targetCwd = pendingAutoMoveTarget;
+            if (!targetCwd || !autoCwdEnabled || moveInProgress) return;
+            if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+                scheduleAutoMove(ctx, 100);
+                return;
+            }
 
+            pendingAutoMoveTarget = undefined;
+            void moveCurrentSession(targetCwd, ctx, {
+                commandName: "auto cwd detection",
+                actionName: "auto-moving",
+                deferIfBusy: true,
+            });
+        }, delayMs);
+        autoMoveTimer.unref();
+    };
+
+    pi.on("agent_end", (_event, ctx) => scheduleAutoMove(ctx));
+    pi.on("agent_settled", (_event, ctx) => scheduleAutoMove(ctx));
+
+    const clearPendingAutoMove = () => {
+        clearTimeout(autoMoveTimer);
+        autoMoveTimer = undefined;
         pendingAutoMoveTarget = undefined;
-        await moveCurrentSession(targetCwd, ctx, {
-            commandName: "auto cwd detection",
-            actionName: "auto-moving",
-        });
-    });
+        pendingCwdProbes.clear();
+    };
+    pi.on("session_start", clearPendingAutoMove);
+    pi.on("session_shutdown", clearPendingAutoMove);
 
     pi.on("user_bash", (event, ctx) => {
         if (!autoCwdEnabled || moveInProgress) return;
@@ -465,12 +508,8 @@ export default function (pi: ExtensionAPI) {
 
         if (!targetCwd || isSameCwd(targetCwd, event.cwd)) return;
 
-        setImmediate(() => {
-            void moveCurrentSession(targetCwd, ctx, {
-                commandName: "auto cwd detection",
-                actionName: "auto-moving",
-            });
-        });
+        pendingAutoMoveTarget = targetCwd;
+        scheduleAutoMove(ctx);
 
         return {
             result: {
