@@ -216,7 +216,7 @@ export default function (pi: ExtensionAPI) {
     const moveCurrentSession = async (
         rawTargetCwd: string,
         ctx: MoveSessionContext,
-        options: { commandName: string; actionName: string; deferIfBusy?: boolean },
+        options: { commandName: string; actionName: string; deferIfBusy?: boolean; auto?: boolean },
     ) => {
         if (moveInProgress) return;
         // Older supported Pi contexts expose hasUI, but not mode.
@@ -254,7 +254,11 @@ export default function (pi: ExtensionAPI) {
             moveInProgress = false;
             const code = error?.code;
             if (code === "ENOENT") {
-                ctx.ui.notify(`Path does not exist: ${targetCwd}`, "error");
+                // An automatic move waits for idle, so the detected directory can be
+                // gone by now (a scratch directory removed in the same turn). Drop it.
+                if (!options.auto) {
+                    ctx.ui.notify(`Path does not exist: ${targetCwd}`, "error");
+                }
             } else {
                 ctx.ui.notify(`Cannot access path: ${targetCwd}`, "error");
             }
@@ -479,6 +483,7 @@ export default function (pi: ExtensionAPI) {
                 commandName: "auto cwd detection",
                 actionName: "auto-moving",
                 deferIfBusy: true,
+                auto: true,
             });
         }, delayMs);
         autoMoveTimer.unref();
