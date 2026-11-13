@@ -178,6 +178,27 @@ for (const busyKind of ["retry/compaction", "queued work"]) {
     });
 }
 
+test("automatic move to a vanished target is cancelled without an error notification", async () => {
+    const f = await fixture();
+    try {
+        const target = join(f.directory, "target");
+        fs.mkdirSync(target);
+        detectToolCwd(f, target);
+        // Same-turn cleanup removes the probe directory before agent_end runs the move.
+        fs.rmSync(target, { recursive: true, force: true });
+        await f.events.get("agent_end")({}, f.ctx);
+        await wait();
+        assert.equal(f.children.length, 0);
+        assert.deepEqual(f.notifications.filter(([, level]) => level === "error"), []);
+        // A later detected cwd still moves after the cancelled one.
+        fs.mkdirSync(target);
+        detectToolCwd(f, target);
+        await f.events.get("agent_end")({}, f.ctx);
+        await wait();
+        assert.equal(f.children.length, 1);
+    } finally { f.cleanup(); }
+});
+
 test("user-bash move releases terminal after result and repeated child sessions stay stopped", async () => {
     const parents = [];
     try {
